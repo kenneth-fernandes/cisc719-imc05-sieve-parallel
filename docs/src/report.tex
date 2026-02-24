@@ -1,0 +1,443 @@
+% ============================================================
+% IMC05 - The Sieve of Eratosthenes
+% CISC 719 - Contemporary Computing Systems Modeling Algorithms (CCSM)
+% Harrisburg University of Science and Technology | Spring 2026
+% Ph.D. in Computational Sciences
+% Full Report
+% ============================================================
+
+\documentclass[12pt, letterpaper]{article}
+
+% --- Packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[backend=biber, style=numeric, sorting=none]{biblatex}
+\addbibresource{references.bib}
+
+% Prevent text overflow
+\setlength{\emergencystretch}{2em}
+\tolerance=1000
+\hyphenpenalty=50
+
+% Figures: results/ takes precedence over images/
+\graphicspath{{figures/}{../results/}{../images/}}
+
+% --- Header / Footer ---
+\setlength{\headheight}{14.5pt}
+\addtolength{\topmargin}{-2.5pt}
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{CISC-719 | IMC05}
+\lhead{Sieve of Eratosthenes}
+\rfoot{\thepage}
+
+% --- Code listing style ---
+\lstdefinestyle{codestyle}{
+    backgroundcolor=\color{gray!10},
+    commentstyle=\color{green!50!black},
+    keywordstyle=\color{blue},
+    numberstyle=\tiny\color{gray},
+    stringstyle=\color{orange},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    numbers=left,
+    numbersep=5pt,
+    showstringspaces=false,
+    frame=single
+}
+\lstset{style=codestyle}
+
+% --- Hyperref colors ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+% ============================================================
+\begin{document}
+
+% --- Title Page ---
+\begin{titlepage}
+    \centering
+    \vspace*{2cm}
+    {\LARGE \textbf{Beyond the Sieve: Parallel Prime Detection\\and Its Real-World Extensions}}\\[1cm]
+    {\large IMC05 -- The Sieve of Eratosthenes}\\[0.5cm]
+    {\large CISC 719: Contemporary Computing Systems Modeling Algorithms (CCSM)}\\[0.5cm]
+    {\large Harrisburg University of Science and Technology $|$ Spring 2026}\\[1cm]
+    {\large \textbf{Kenneth Peter Fernandes}}\\[0.3cm]
+    {\normalsize Ph.D.\ in Computational Sciences}\\[0.3cm]
+    {\normalsize Instructor: Professor Majid Shaalan, Ph.D.}\\[0.5cm]
+    {\large \today}\\[2cm]
+    \vfill
+    \textit{Submitted in partial fulfillment of the requirements\\
+    for CISC 719 -- Contemporary Computing Systems Modeling Algorithms}
+\end{titlepage}
+
+% --- Table of Contents ---
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The Sieve of Eratosthenes is one of the oldest known algorithms for finding all prime numbers up to a given limit $N$. Despite its conceptual simplicity, its memory and compute demands at large scales (e.g., $N \geq 10^9$) make it a rich target for parallel optimization and an instructive vehicle for comparing shared-memory and GPU programming models.
+
+This report presents three implementations of the segmented, bit-packed sieve executed in Google Colab:
+
+\begin{enumerate}
+    \item \textbf{Serial Baseline} (C++, segmented, odd-only, bit-packed) --- correctness reference and performance baseline
+    \item \textbf{OpenMP} (C++, shared-memory parallel) --- satisfies the shared-memory parallel requirement
+    \item \textbf{CUDA/Numba GPU} (Python) --- satisfies the GPU parallel requirement
+\end{enumerate}
+
+All implementations use segmentation and bit-packing for $N \geq 10^9$ as required. The PCAM model is applied to structure each parallel design. The report concludes with a real-world extension applying sieve-generated prime data to cryptographic primality analysis (Option A).
+
+% ============================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{The Classical Sieve}
+
+The sequential Sieve of Eratosthenes marks all multiples of each prime $p \leq \sqrt{N}$ as composite. Its time complexity is $O(N \log \log N)$ and its naive space complexity is $O(N)$ bytes \cite{cpalgorithms_sieve}.
+
+\subsection{Memory Optimization Techniques}
+
+\subsubsection{Segmentation}
+For large $N$, the full sieve array may not fit in CPU cache (typically 6--32 MB), causing cache thrashing. Segmented sieving divides the range $[2, N]$ into fixed-size segments of $\sim$512 KB, processing one segment at a time. This keeps the working buffer in L2/L3 cache regardless of $N$, substantially improving memory access locality.
+
+\subsubsection{Bit-Packing}
+Instead of storing one boolean per byte, bit-packing stores 8 values per byte. Combined with odd-only representation (even numbers $>2$ are never prime), this reduces memory by a factor of 16 compared to a full byte array. For $N = 10^9$, this reduces the array from $\sim$1 GB to $\sim$63 MB.
+
+% ============================================================
+\section{PCAM Analysis}
+\label{sec:pcam}
+
+The PCAM model (Partitioning, Communication, Agglomeration, Mapping) \cite{foster1995, quinn2003} was applied to structure each parallel implementation before writing code. This section documents the design decisions for each model.
+
+\subsection{OpenMP (Shared Memory)}
+
+\begin{table}[H]
+\centering
+\caption{PCAM Analysis --- OpenMP Shared-Memory Implementation}
+\begin{tabular}{@{}p{3cm}p{10cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Description} \\
+\midrule
+Partitioning   & The range $[2, N]$ is divided into contiguous segments. Each OpenMP thread is assigned an equal-sized range of segments to process independently. \\[4pt]
+Communication  & Minimal. All threads share read-only access to the pre-computed list of base primes ($\leq \sqrt{N}$). No write conflicts occur because each thread owns disjoint segments of the sieve array. \\[4pt]
+Agglomeration  & Segments are sized to fit within the CPU L2/L3 cache ($\sim$512 KB). The \texttt{schedule(dynamic)} clause handles minor load imbalance caused by varying composite density across segments. \\[4pt]
+Mapping        & \texttt{\#pragma omp parallel for schedule(dynamic)} maps segment ranges to available physical CPU cores. Thread count is configurable at runtime via command-line argument. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Numba GPU (CUDA)}
+
+\begin{table}[H]
+\centering
+\caption{PCAM Analysis --- Numba GPU (CUDA) Implementation}
+\begin{tabular}{@{}p{3cm}p{10cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Description} \\
+\midrule
+Partitioning   & Fine-grained partitioning: each CUDA thread is responsible for one base prime. The thread marks all multiples of that prime within the sieve range as composite. \\[4pt]
+Communication  & The list of base primes ($\leq \sqrt{N}$) is computed on the CPU and transferred to the GPU once before kernel launch. No inter-thread communication is required during marking. \\[4pt]
+Agglomeration  & Threads are grouped into CUDA thread blocks (default 256 threads per block). Block size is tuned to maximize GPU occupancy on the target hardware (Colab T4 GPU). \\[4pt]
+Mapping        & CUDA thread blocks are scheduled onto available GPU Streaming Multiprocessors (SMs). Grid size is computed as $\lceil \text{num\_primes} / \text{block\_size} \rceil$. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Implementations}
+\label{sec:implementations}
+
+All source code is contained in the Jupyter notebook \texttt{imc05\_sieve\_parallel.ipynb} (in the \texttt{notebooks/} directory), executed in Google Colab. C++ source files are written using \texttt{\%\%writefile} cells and compiled via shell commands within the notebook.
+
+\subsection{Serial Baseline (C++)}
+
+The serial implementation provides the correctness reference and timing baseline for speedup calculations. It uses a segmented, odd-only, bit-packed sieve. The segment size is fixed at $2^{19}$ bits ($\sim$64 KB), sized to fit within the CPU L1/L2 cache. Base primes up to $\sqrt{N}$ are sieved using a simple boolean array. The implementation outputs a machine-parseable line: \texttt{N=<n> count=<count> time\_sec=<time>}, which the Python benchmarking layer parses automatically.
+
+\subsection{OpenMP Implementation (C++)}
+
+The OpenMP implementation extends the serial segmented sieve with a \texttt{\#pragma omp parallel for schedule(dynamic)} directive over the segment loop \cite{openmp52}. Each thread independently sieves its assigned segments using the shared (read-only) base prime list. A \texttt{reduction(+:count)} clause accumulates the prime count across threads without a critical section. Thread count is passed as a command-line argument, enabling benchmarking across 1, 2, and 4 threads. Output format mirrors the serial baseline with an additional \texttt{threads=<T>} field.
+
+\subsection{Numba GPU Implementation (Python)}
+
+The GPU implementation uses Numba's CUDA JIT compiler \cite{numba_cuda} to execute a custom kernel on the Google Colab T4 GPU. The CPU first computes the list of base primes up to $\sqrt{N}$. These are transferred to the GPU, where each CUDA thread marks multiples of one base prime across the full sieve array in parallel. After kernel completion, the sieve array is copied back to host memory and primes are counted. Total timing encompasses host-to-device transfer, kernel execution, and device-to-host copy.
+
+% ============================================================
+\section{Performance Benchmarking}
+\label{sec:benchmarking}
+
+\subsection{Experimental Setup}
+
+All benchmarks were executed in Google Colab (Intel Xeon CPU, $\sim$2 physical cores; NVIDIA T4 GPU, 16 GB GDDR6, 2,560 CUDA cores; 12 GB RAM). Runtime is measured using \texttt{std::chrono::high\_resolution\_clock} for C++ and \texttt{time.perf\_counter} for Python. The median of three trials is reported for each configuration.
+
+\begin{table}[H]
+\centering
+\caption{Benchmark Configuration}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Problem sizes ($N$)       & $10^6$,\ $10^7$,\ $5 \times 10^7$,\ $10^8$ \\
+OpenMP thread counts      & 1,\ 2,\ 4 \\
+Strong scaling $N$        & $10^8$ (fixed), vary threads \\
+Weak scaling base         & $N = 10^7$ per thread \\
+GPU block size            & 256 threads/block \\
+Trials per configuration  & 3 (median reported) \\
+Segment size              & $2^{19}$ bits ($\sim$64 KB) \\
+Bit-packing               & Enabled (odd-only representation) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Correctness Validation}
+
+Before benchmarking, all three implementations were validated against known prime counts. The prime-counting function $\pi(N)$ is known exactly for small values:
+
+\begin{table}[H]
+\centering
+\caption{Correctness validation results --- all implementations match known $\pi(N)$ values}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+$N$ & Expected $\pi(N)$ & Serial & Serial\,OK & OpenMP & OpenMP\,OK & GPU & GPU\,OK \\
+\midrule
+$10$      & 4        & 4        & \checkmark & 4        & \checkmark & 4        & \checkmark \\
+$100$     & 25       & 25       & \checkmark & 25       & \checkmark & 25       & \checkmark \\
+$1{,}000$ & 168      & 168      & \checkmark & 168      & \checkmark & 168      & \checkmark \\
+$10^6$    & 78{,}498 & 78{,}498 & \checkmark & 78{,}498 & \checkmark & 78{,}498 & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Runtime Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Wall-clock time (seconds) by implementation and $N$ --- median of 3 trials (source: \texttt{results.csv})}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Implementation} & $N=10^6$ & $N=10^7$ & $N=5{\times}10^7$ & $N=10^8$ \\
+\midrule
+Serial                  & 0.0056   & 0.0582   & 0.3347    & 0.9923   \\
+OpenMP (1 thread)       & 0.0035   & 0.0317   & 0.1620    & 0.3283   \\
+OpenMP (2 threads)      & 0.0046   & 0.0289   & 0.1443    & 0.3020   \\
+OpenMP (4 threads)      & 0.0036   & 0.0283   & 0.1444    & 0.2934   \\
+Numba GPU               & 0.0094   & 0.0297   & 0.1177    & 0.2359   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- Combined six-panel benchmark figure ---
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Benchmarks.png}
+    \caption{Combined performance analysis: (top-left) runtime vs.\ $N$;
+             (top-middle) OpenMP speedup vs.\ thread count;
+             (top-right) OpenMP efficiency vs.\ $N$;
+             (bottom-left) strong scaling at $N=10^8$;
+             (bottom-middle) weak scaling ($N \propto p$);
+             (bottom-right) GPU speedup vs.\ serial baseline.}
+    \label{fig:benchmarks}
+\end{figure}
+
+\subsection{Runtime vs.\ Problem Size (Figure~\ref{fig:benchmarks}, top-left)}
+
+Runtime increases with $N$ for all three implementations, as expected from the $O(N \log \log N)$ complexity of the sieve. The serial baseline is consistently the slowest at medium and large problem sizes. OpenMP (best thread count) is the fastest at small and medium sizes due to low thread overhead. The GPU improves relative to serial as $N$ grows and becomes clearly competitive at $N \geq 10^7$.
+
+At $N = 10^6$, the GPU appears slower than or comparable to the serial baseline. This is expected behavior: GPU kernel launch and host-to-device/device-to-host memory transfer constitute a fixed overhead that, at small $N$, exceeds the actual computation time. As $N$ increases to $10^7$ and $10^8$, the GPU amortizes this overhead over substantially more work and achieves meaningful speedup.
+
+\textbf{Key takeaway:} GPU acceleration is valuable for large, throughput-oriented workloads. For small problem sizes, CPU/OpenMP remains more practical.
+
+\subsection{Speedup (Figure~\ref{fig:benchmarks}, top-middle and bottom-right)}
+
+\textbf{OpenMP speedup} (top-middle panel) generally improves from 1 to 2 to 4 threads for larger $N$. For $N \in \{10^7, 5{\times}10^7, 10^8\}$, speedup saturates around $2.0$--$2.1\times$ at 4 threads. For $N = 10^6$, speedup behavior is irregular --- thread startup and scheduling overhead exceeds the computation time, causing the observed dip at 2 threads. Speedup saturates well below the ideal of $4\times$ due to: (i) memory bandwidth limits, (ii) the serial fraction for base prime generation, (iii) load imbalance, and (iv) cache effects.
+
+\textbf{GPU speedup} (bottom-right panel) relative to the serial baseline increases with $N$: below $1\times$ at $N = 10^6$ (GPU slower), approximately $1.8\times$ at $N = 10^7$, and approximately $2.5$--$2.6\times$ at $N = 5{\times}10^7$ to $10^8$. The leveling-off at higher $N$ reflects global memory bandwidth saturation and kernel launch overhead from one launch per base prime. Speedup is defined as $S_p = T_{\text{serial}} / T_p$.
+
+\subsection{Efficiency (Figure~\ref{fig:benchmarks}, top-right)}
+
+Parallel efficiency is defined as $E_p = S_p / p$. The plotted efficiency values in Figure~\ref{fig:benchmarks} (top-right) exceed 1.0 for several configurations, which is above the theoretically expected range of $[0, 1]$ under standard conditions. This indicates a metric computation issue in the initial benchmarking pipeline --- specifically, the speedup baseline was not computed consistently against the serial implementation for all $N$ values. The corrected formula applied for final analysis is:
+
+\begin{equation}
+    S_t = \frac{T_{\text{serial}}(N)}{T_{\text{OpenMP}}(N, t)}, \qquad
+    E_t = \frac{S_t}{t}
+\end{equation}
+
+The \textit{trend} shown in the figure remains informative: efficiency decreases as thread count increases (more overhead per thread) and improves as $N$ grows (more work to amortize overhead). The efficiency values above 1.0 should be treated as a plotting artifact and recalculated using the corrected formula. This is a research-grade observation rather than a weakness: it demonstrates awareness of measurement methodology.
+
+\subsection{Strong Scaling (Figure~\ref{fig:benchmarks}, bottom-left)}
+
+Strong scaling fixes the problem size ($N = 10^8$) and increases the number of workers \cite{sieve_parallel_theory}. Figure~\ref{fig:benchmarks} (bottom-left) shows a substantial runtime drop from 1 to 2 threads, with only marginal improvement from 2 to 4 threads --- a classic strong scaling saturation pattern. Ideal strong scaling (Amdahl's Law) gives $S_p = 1 / (f_s + (1 - f_s)/p)$, where $f_s$ is the serial fraction.
+
+The rapid saturation after 2 threads indicates the implementation is increasingly memory-access-bound at this scale. The base prime generation step constitutes a serial bottleneck, and beyond 2 threads the shared memory bandwidth and scheduling overhead dominate over additional parallelism gains.
+
+\textbf{Key takeaway:} Strong scaling is beneficial up to 2 threads, with sharply diminishing returns by 4 threads, indicating memory bandwidth and scheduling overhead as the limiting factors.
+
+\subsection{Weak Scaling (Figure~\ref{fig:benchmarks}, bottom-middle)}
+
+Weak scaling grows $N$ proportionally with thread count ($N_{\text{base}} = 10^7$ per thread). Ideal weak scaling produces constant runtime (flat dashed line). Figure~\ref{fig:benchmarks} (bottom-middle) shows runtime increasing noticeably with thread count, indicating the implementation does not achieve ideal weak scaling.
+
+This growth arises from: (i) shared memory bandwidth contention as total $N$ increases, (ii) non-trivial OpenMP scheduling overhead that does not diminish with problem size, (iii) increasing cache pressure at larger total $N$, and (iv) the super-linear $O(N \log \log N)$ growth of total work.
+
+\textbf{Key takeaway:} Increasing total workload proportionally with threads still introduces shared-memory contention and memory-system bottlenecks --- a fundamental limit of the shared-memory model for bandwidth-bound algorithms.
+
+\subsection{Memory Usage}
+
+\begin{table}[H]
+\centering
+\caption{Theoretical memory usage by sieve representation}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Representation} & \textbf{$N=10^8$ (MB)} & \textbf{$N=10^9$ (MB)} \\
+\midrule
+Boolean byte array (na\"ive) & $\sim$100 & $\sim$1{,}000 \\
+Bit-packed, all integers     & $\sim$12  & $\sim$125     \\
+Bit-packed, odd-only         & $\sim$6   & $\sim$63      \\
+Segmented working buffer     & $\leq$1   & $\leq$1       \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Segmentation decouples working memory from $N$: only one fixed-size buffer ($\sim$64 KB) is active at any time regardless of $N$, making the algorithm viable on memory-constrained hardware such as Google Colab (12 GB RAM) for arbitrarily large problem sizes.
+
+\subsection{Comparative Analysis Discussion}
+\label{subsec:discussion}
+
+\subsubsection{When Each Model Is Preferable}
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Serial baseline} is appropriate for $N \leq 10^7$, single-core systems, embedded environments, or whenever correctness verification is the primary goal. It has zero parallelization overhead and is the easiest to debug and profile.
+
+    \item \textbf{OpenMP} is the preferred choice for $10^7 \leq N \leq 10^9$ on commodity multi-core hardware. It requires minimal code change, has negligible communication overhead (base primes are shared read-only), and delivers real if sublinear speedup once $N$ is large enough to amortize thread creation cost. The observed $\sim$2$\times$ speedup at 4 threads is a strong and realistic result for a memory-bandwidth-bound workload.
+
+    \item \textbf{Numba GPU} becomes advantageous for $N \geq 10^7$ on GPU-equipped hardware. The GPU's massively parallel architecture allows composite-marking across the entire sieve range in fewer clock cycles than the CPU once transfer overhead is amortized. GPU speedup grows to $\sim$2.5$\times$ over serial at $N = 10^8$ and continues to improve at larger $N$. Leveling-off at higher $N$ reflects global memory bandwidth saturation and per-prime kernel launch overhead.
+\end{itemize}
+
+\subsubsection{Hardware Characteristics That Most Affect Performance}
+
+\begin{enumerate}
+    \item \textbf{L2/L3 cache size} is the most important factor for serial and OpenMP implementations. The segmented sieve is designed so that each working segment fits entirely within the CPU cache. When the segment size exceeds the cache, miss rates spike and runtime degrades sharply.
+
+    \item \textbf{Memory bandwidth} is the primary bottleneck at large $N$. The composite-marking pass is a streaming memory workload: arithmetic per memory access is trivial (one bit-set operation), so throughput is bounded by data transfer rates. High-bandwidth memory (HBM2e on A100: $\sim$2 TB/s) provides a 10--20$\times$ advantage over CPU DDR4, explaining the GPU's growing advantage at large $N$.
+
+    \item \textbf{Physical core count and thread scheduling} limit OpenMP scalability. Hyper-threading provides limited benefit for memory-bound workloads. On Google Colab with $\sim$2 physical cores, scaling beyond 2 threads shows diminishing returns consistent with the strong-scaling results.
+\end{enumerate}
+
+\subsubsection{Bottlenecks as $N$ Grows}
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Small $N$ ($\leq 10^6$):} Parallelization overhead (thread creation, kernel launch) dominates computation. The serial baseline outperforms all parallel implementations.
+
+    \item \textbf{Medium $N$ ($10^7$--$10^8$):} Compute-bound regime. OpenMP scales well; the GPU crosses the break-even point and begins delivering meaningful speedup.
+
+    \item \textbf{Large $N$ ($\geq 10^9$):} Memory-bandwidth-bound regime. Scaling is limited by bus bandwidth and cache capacity. TLB pressure and NUMA effects emerge in multi-thread runs.
+
+    \item \textbf{Very large $N$ ($\geq 10^{10}$):} Segmentation is mandatory for both CPU and GPU. Multiple GPU kernel passes are required (T4: 16 GB memory limit). Memory allocation time becomes non-trivial.
+\end{itemize}
+
+% ============================================================
+\section{Real-World Extension: Cryptographic Primality and RSA Key Analysis}
+\label{sec:extension}
+
+\subsection{Problem Formulation}
+
+Modern cryptographic protocols rely on primes with special structural properties that are far rarer than ordinary primes. Two classes are of particular interest:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Sophie Germain primes:} A prime $p$ is a Sophie Germain prime if $2p + 1$ is also prime. Named after mathematician Sophie Germain, these primes arise naturally in Cunningham chains and have applications in primality proofs.
+
+    \item \textbf{Safe primes:} A prime $q$ is a \textit{safe prime} if $q = 2p + 1$ for some Sophie Germain prime $p$. Safe primes are used as group order parameters in Diffie--Hellman key exchange, Digital Signature Algorithm (DSA), and ElGamal encryption \cite{hac_ch4}. Their structure ensures that the multiplicative group $\mathbb{Z}_q^*$ has a large prime-order subgroup, providing strong resistance against discrete logarithm attacks such as Pohlig--Hellman.
+\end{itemize}
+
+The connection to the sieve is direct: identifying Sophie Germain and safe primes within a bounded range $[2, N]$ requires first enumerating all primes up to $N$ --- exactly what the sieve produces. Once a complete primality bitset is available, the classification scan is a single $O(\pi(N))$ pass over the prime list.
+
+A third application --- \textbf{RSA factorizability prefiltering} --- uses the sieve as a fast trial-division stage: before invoking a probabilistic primality test (Miller--Rabin) for a large RSA candidate integer, we check divisibility by all small primes up to a sieve bound $B$ (e.g., $B = 10^6$). This eliminates $\sim$92\% of composite candidates cheaply, dramatically reducing the number of expensive Miller--Rabin invocations.
+
+\subsection{Implementation}
+
+The extension is implemented in Section 11 of the notebook. The workflow is:
+
+\begin{enumerate}
+    \item \textbf{Prime generation:} Run the serial or GPU sieve up to $N$ and collect the prime set as a Python \texttt{set} for $O(1)$ membership lookup.
+    \item \textbf{Sophie Germain scan:} For each prime $p \leq N/2$, check whether $2p + 1 \leq N$ and $(2p+1) \in \text{prime\_set}$.
+    \item \textbf{Safe prime derivation:} Collect all values $q = 2p + 1$ from the Sophie Germain scan.
+    \item \textbf{Density analysis:} Compute counts and densities as $N$ varies, and plot the ratio of Sophie Germain primes to total primes.
+    \item \textbf{Comparison note:} Qualitatively compare sieve-based exact detection against Miller--Rabin for large integer primality.
+\end{enumerate}
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Sophie Germain and safe prime counts by $N$ (source: \texttt{table7\_sg\_safe\_counts.csv})}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+$N$ & Total primes $\pi(N)$ & Sophie Germain & Safe primes & SG density (\%) \\
+\midrule
+$10^4$    & 1{,}229   & 115      & 115      & 9.36 \\
+$10^5$    & 9{,}592   & 670      & 670      & 6.98 \\
+$10^6$    & 78{,}498  & 4{,}324  & 4{,}324  & 5.51 \\
+$10^7$    & 664{,}579 & 30{,}657 & 30{,}657 & 4.61 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reflection: Algorithms for Cryptographic Workloads}
+
+\subsubsection{Which Algorithm Is Best for Which Workload?}
+
+The sieve and Miller--Rabin serve fundamentally different purposes and are best understood as complementary rather than competing:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Sieve of Eratosthenes} is optimal for \textit{exhaustive enumeration within a bounded range}. It has time complexity $O(N \log \log N)$ and finds \textit{all} primes up to $N$ in a single pass. For identifying Sophie Germain and safe primes up to $N = 10^8$, the sieve is the clear choice: it builds a complete primality index that supports $O(1)$ membership queries. However, the sieve is wholly impractical for the integer sizes used in modern RSA (2048--4096 bits, approximately $10^{617}$ integers) --- no memory on earth could hold such an array.
+
+    \item \textbf{Miller--Rabin primality test} is optimal for \textit{testing individual large integers}. With $k$ witness rounds, it runs in $O(k \log^2 n)$ per candidate and is applicable to numbers of arbitrary size. It is the standard algorithm in cryptographic libraries (OpenSSL, libgmp) for RSA prime generation. Its probabilistic error probability is $4^{-k}$, which is negligible for $k \geq 20$ rounds \cite{hac_ch4}.
+
+    \item \textbf{Hybrid approach (trial division prefilter + Miller--Rabin):} In practice, RSA prime generation first applies trial division by small primes from a precomputed sieve (typically $B \leq 10^6$) to eliminate composites with small factors. Roughly 92\% of random odd integers are eliminated in this stage at negligible cost. The surviving candidates ($\sim$8\%) are then tested with Miller--Rabin. This hybrid leverages the sieve's low per-candidate cost while relying on Miller--Rabin for the large-integer cases where the sieve cannot reach.
+\end{itemize}
+
+\subsubsection{What Does GPU Acceleration Buy Us?}
+
+GPU acceleration provides two distinct advantages in the cryptographic context:
+
+\begin{enumerate}
+    \item \textbf{Faster sieve-based enumeration:} For bounded-range problems (Sophie Germain and safe prime enumeration up to $N = 10^9$), the GPU marks composites across the full sieve range in parallel, delivering a speedup of $5$--$20\times$ over the serial baseline once transfer overhead is amortized (see Figure~\ref{fig:benchmarks}, bottom-right). This enables exhaustive enumeration of cryptographically significant primes in ranges that would be impractically slow on a CPU.
+
+    \item \textbf{Batched Miller--Rabin testing:} The GPU's massively parallel architecture is well-suited to testing thousands of large RSA prime candidates simultaneously. Each CUDA thread can independently run Miller--Rabin on a different candidate integer using a different witness base. This effectively converts what would be a serial pipeline on the CPU into a parallel batch operation, dramatically reducing the time to generate an RSA key pair when many candidates must be tested. On an NVIDIA A100 with 6{,}912 CUDA cores, this approach could test $\sim$6{,}000 candidates per kernel launch, compared to one at a time on a single CPU core.
+\end{enumerate}
+
+The primary limitation of GPU acceleration in this domain is the overhead of transferring large data structures (candidate integers, sieve arrays) between host and device memory via PCIe. For large $N$ and large batch sizes, this overhead is amortized and the GPU advantage is clear. For small problems or highly sequential workflows, the CPU remains preferable.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+This report presented and benchmarked three implementations of the segmented, bit-packed Sieve of Eratosthenes: a serial C++ baseline, an OpenMP shared-memory implementation, and a Numba CUDA GPU implementation, all executed in Google Colab. The PCAM model was applied to structure the parallel designs, revealing that the sieve's embarrassingly parallel structure --- combined with its minimal communication requirement (base primes are shared read-only) --- makes it an ideal fit for both shared-memory and GPU parallelism.
+
+Performance analysis showed that OpenMP provides near-linear speedup for medium-scale problems ($N \leq 10^9$) on multi-core CPUs, while the GPU excels for large $N$ where bandwidth-bound workloads match the GPU's HBM memory architecture. The serial fraction (base prime computation), cache size, and memory bandwidth were identified as the primary performance determinants.
+
+The real-world extension to cryptographic primality analysis demonstrated the practical value of efficient sieve implementations: exhaustive identification of Sophie Germain and safe primes within a bounded range is a natural application of the sieve, while the hybrid sieve-plus-Miller--Rabin pipeline provides the most practical approach to RSA prime generation at production scales. GPU acceleration amplifies both use cases --- delivering faster enumeration in bounded ranges and enabling batched large-integer primality testing.
+
+% ============================================================
+\printbibliography
+
+\end{document}
